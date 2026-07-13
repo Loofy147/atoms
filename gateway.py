@@ -20,20 +20,29 @@ import time
 
 DB_PATH = os.environ.get("GATEWAY_DB", os.path.join(os.path.dirname(__file__), "gateway_cache.db"))
 
+_initialized = False
+
 
 def idempotency_key(workflow_id: str, step: str) -> str:
     return hashlib.sha256(f"{workflow_id}_{step}".encode()).hexdigest()
 
 
 def _conn():
+    global _initialized
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("""CREATE TABLE IF NOT EXISTS cache (
-        key TEXT PRIMARY KEY, result TEXT, created_ts REAL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS call_counter (
-        tool_name TEXT PRIMARY KEY, count INTEGER
-    )""")
-    conn.commit()
+    if not _initialized:
+        # Enable Write-Ahead Logging (WAL) mode for better concurrency and write speed
+        conn.execute("PRAGMA journal_mode = WAL")
+        # Set synchronous mode to NORMAL for safer fast writes without full sync on every transaction
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS cache (
+            key TEXT PRIMARY KEY, result TEXT, created_ts REAL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS call_counter (
+            tool_name TEXT PRIMARY KEY, count INTEGER
+        )""")
+        conn.commit()
+        _initialized = True
     return conn
 
 
