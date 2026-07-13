@@ -20,6 +20,7 @@ def main():
     ap.add_argument("--workflow", required=True)
     ap.add_argument("--decision", required=True, choices=["approved", "rejected"])
     ap.add_argument("--operator", default="human-operator")
+    ap.add_argument("--evaluation-log", default="{}")
     args = ap.parse_args()
 
     events = wal.read_events(args.workflow)
@@ -33,9 +34,13 @@ def main():
     if not state["waiting_approval"]:
         raise SystemExit(f"workflow {args.workflow} is not waiting for approval right now (state={state})")
 
-    wal.append_event(args.workflow, "HUMAN_DECISION",
-                      {"decision": args.decision, "operator": args.operator})
-    print(f"[resume] committed HUMAN_DECISION={args.decision} by {args.operator} to WAL.")
+    # Appending valid operator evaluation logs via a Continuity Trigger
+    wal.append_event(args.workflow, "HUMAN_DECISION", {
+        "decision": args.decision,
+        "operator": args.operator,
+        "evaluation_log": args.evaluation_log
+    })
+    print(f"[resume] committed HUMAN_DECISION={args.decision} by {args.operator} to WAL with evaluation_log={args.evaluation_log}.")
     print(f"[resume] handing back to coordinator.run() to finish the workflow...")
     coordinator.run(args.workflow)
 
