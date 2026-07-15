@@ -5,7 +5,7 @@ Holds no long-lived in-memory state of its own. Every call to run() derives
 "where are we" purely by replaying the WAL from disk, then dispatches the
 next step to a fresh stateless worker subprocess. This is what makes it
 safe for the coordinator process itself to die and be restarted, and safe
-for it to deliberately exit while waiting on a human (Scene 6/7).
+for it to deliberately exit while waiting on a human.
 """
 import argparse
 import os
@@ -30,18 +30,27 @@ def start_workflow(workflow_id: str, expense: dict):
 def derive_state(events: list[dict]) -> dict:
     types = [e["type"] for e in events]
     risk = None
+    approver = None
+    evaluation_log = None
     for e in events:
-        if e["type"] == "REASON_DONE":
+        if e["type"] == "CLASSIFY_DONE":
             risk = e["payload"].get("risk")
+        elif e["type"] == "ROUTE_DONE":
+            approver = e["payload"].get("approver")
+        elif e["type"] == "HUMAN_DECISION":
+            evaluation_log = e["payload"].get("evaluation_log")
     return {
         "fetched": "FETCH_DONE" in types,
         "verified": "VERIFY_DONE" in types,
-        "reasoned": "REASON_DONE" in types,
+        "classified": "CLASSIFY_DONE" in types,
+        "routed": "ROUTE_DONE" in types,
         "waiting_approval": "WAIT_APPROVAL" in types and "HUMAN_DECISION" not in types,
         "human_decided": "HUMAN_DECISION" in types,
         "recorded": "RECORD_DONE" in types,
         "completed": "TASK_COMPLETED" in types,
         "risk": risk,
+        "approver": approver,
+        "evaluation_log": evaluation_log,
     }
 
 
@@ -58,8 +67,6 @@ def wait_for_event(workflow_id: str, event_type: str, proc: subprocess.Popen, ti
         if any(e["type"] == event_type for e in wal.read_events(workflow_id)):
             return True
         if proc.poll() is not None:
-            # process has exited -- give the WAL one more read in case the
-            # event and the exit raced, then give up.
             time.sleep(0.05)
             return any(e["type"] == event_type for e in wal.read_events(workflow_id))
         time.sleep(0.15)
@@ -74,12 +81,14 @@ def run(workflow_id: str, crash_on_verify: bool = False, heartbeat_timeout: floa
     state = derive_state(events)
     print(f"[coordinator] replayed {len(events)} event(s) from WAL -> derived state: {state}")
 
+    # Step 1: FETCH
     if not state["fetched"]:
         print("[coordinator] dispatching FETCH")
         proc = dispatch(workflow_id, "FETCH")
         proc.wait()
         state = derive_state(wal.read_events(workflow_id))
 
+    # Step 2: VERIFY
     if not state["verified"]:
         os.makedirs(MARKER_DIR, exist_ok=True)
         marker_path = os.path.join(MARKER_DIR, f"{workflow_id}_verify_gateway_done")
@@ -123,21 +132,47 @@ def run(workflow_id: str, crash_on_verify: bool = False, heartbeat_timeout: floa
             if not state["verified"]:
                 raise RuntimeError("VERIFY failed on retry -- aborting workflow")
 
-    if not state["reasoned"]:
-        print("[coordinator] dispatching REASON")
-        proc = dispatch(workflow_id, "REASON")
+    # Step 3: CLASSIFY
+    if not state["classified"]:
+        print("[coordinator] dispatching CLASSIFY")
+        proc = dispatch(workflow_id, "CLASSIFY")
         proc.wait()
         state = derive_state(wal.read_events(workflow_id))
-        print(f"[coordinator] REASON result: risk={state['risk']}")
+        print(f"[coordinator] CLASSIFY result: risk={state['risk']}")
 
-    if state["risk"] == "HIGH_RISK" and not state["human_decided"]:
+    # Step 4: ROUTE
+    if not state["routed"]:
+        print("[coordinator] dispatching ROUTE")
+        proc = dispatch(workflow_id, "ROUTE")
+        proc.wait()
+        state = derive_state(wal.read_events(workflow_id))
+        print(f"[coordinator] ROUTE result: approver={state['approver']}")
+
+    # Step 5: WAIT_APPROVAL (Human Gate)
+    # Yield control if amount is > 5000 (high-privilege CFO transition) or risk is HIGH_RISK
+    init = next(e for e in events if e["type"] == "INIT")
+    expense = init["payload"]["expense"]
+    amount = expense.get("amount_usd", 0.0)
+
+    if (amount > 5000 or state["risk"] == "HIGH_RISK") and not state["human_decided"]:
         if not state["waiting_approval"]:
-            wal.append_event(workflow_id, "WAIT_APPROVAL",
-                              {"reason": "high risk expense requires human sign-off"})
+            # Serialize execution context to WAL
+            context = {
+                "workflow_id": workflow_id,
+                "expense": expense,
+                "risk": state["risk"],
+                "approver": state["approver"],
+                "state_snapshot": state,
+            }
+            wal.append_event(workflow_id, "WAIT_APPROVAL", {
+                "reason": f"expense of ${amount} (risk={state['risk']}, approver={state['approver']}) requires human sign-off",
+                "execution_context_serialized": context,
+            })
         print(f"[coordinator] -> WAIT_APPROVAL. Context is fully persisted in the WAL on disk.")
         print(f"[coordinator] pid {os.getpid()} exiting now. No thread, socket, or memory is held during the wait.")
         return "WAITING"
 
+    # Step 6: RECORD
     if not state["recorded"]:
         print("[coordinator] dispatching RECORD")
         proc = dispatch(workflow_id, "RECORD")

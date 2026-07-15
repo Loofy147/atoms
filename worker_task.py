@@ -50,11 +50,28 @@ def do_verify(workflow_id: str, events: list[dict], args):
     wal.append_event(workflow_id, "VERIFY_DONE", {"ocr_result": result, "was_cached": was_cached})
 
 
-def do_reason(workflow_id: str, events: list[dict], args):
+def do_classify(workflow_id: str, events: list[dict], args):
     fetch = next(e for e in events if e["type"] == "FETCH_DONE")
     expense = fetch["payload"]["expense"]
     classification = llm.classify_expense(expense)
-    wal.append_event(workflow_id, "REASON_DONE", classification)
+    wal.append_event(workflow_id, "CLASSIFY_DONE", classification)
+
+
+def do_route(workflow_id: str, events: list[dict], args):
+    classify_event = next(e for e in events if e["type"] == "CLASSIFY_DONE")
+    risk = classify_event["payload"].get("risk", "HIGH_RISK")
+    init = next(e for e in events if e["type"] == "INIT")
+    expense = init["payload"]["expense"]
+    amount = expense.get("amount_usd", 0.0)
+
+    if amount > 5000:
+        approver = "cfo"
+    elif risk == "HIGH_RISK":
+        approver = "finance-manager"
+    else:
+        approver = "finance-associate"
+
+    wal.append_event(workflow_id, "ROUTE_DONE", {"approver": approver})
 
 
 def do_record(workflow_id: str, events: list[dict], args):
@@ -71,13 +88,12 @@ def do_record(workflow_id: str, events: list[dict], args):
 
 
 # GRASP: Polymorphism -- one handler per step, uniform (workflow_id, events, args)
-# signature, looked up by name instead of branched on by name. Adding a new
-# step later (say SANCTIONS_CHECK) means adding one function + one dict entry,
-# not editing a growing if/elif ladder in main().
+# signature, looked up by name instead of branched on by name.
 STEP_HANDLERS = {
     "FETCH": do_fetch,
     "VERIFY": do_verify,
-    "REASON": do_reason,
+    "CLASSIFY": do_classify,
+    "ROUTE": do_route,
     "RECORD": do_record,
 }
 
@@ -85,7 +101,7 @@ STEP_HANDLERS = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workflow", required=True)
-    ap.add_argument("--step", required=True, choices=["FETCH", "VERIFY", "REASON", "RECORD"])
+    ap.add_argument("--step", required=True, choices=["FETCH", "VERIFY", "CLASSIFY", "ROUTE", "RECORD"])
     ap.add_argument("--delay-before-commit", type=float, default=0.0)
     ap.add_argument("--marker-dir", default=os.path.join(os.path.dirname(__file__), "markers"))
     args = ap.parse_args()
